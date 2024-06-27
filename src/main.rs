@@ -1,99 +1,28 @@
-use rand::Rng;
-use tfhe::prelude::*;
-use tfhe::{generate_keys, set_server_key, ClientKey, ConfigBuilder, FheUint8};
+mod fhe_ascii;
 
-// Simplified PRE structure (placeholder for actual NAL16 implementation)
-struct PRE {
-    // This would contain the actual PRE implementation
+use crate::fhe_ascii::FheAsciiString;
+use recrypt::{
+    api::{EncryptedValue, Plaintext},
+    prelude::*,
+};
+use std::error::Error;
+use tfhe::{generate_keys, set_server_key, ClientKey, ConfigBuilder};
+
+fn pad_vec(mut vec: Vec<u8>, target_length: usize, pad_byte: u8) -> Vec<u8> {
+    if vec.len() < target_length {
+        vec.resize(target_length, pad_byte);
+    }
+    vec
 }
 
-impl PRE {
-    fn setup() -> Self {
-        // Initialize PRE system
-        PRE {}
-    }
+fn main() -> Result<(), Box<dyn Error>> {
+    // 1. Initialize recrypt and generate keypairs
+    let system = Recrypt::new();
+    let (_alice_priv, alice_pub) = system.generate_key_pair().unwrap();
+    let (bob_priv, bob_pub) = system.generate_key_pair().unwrap();
+    let (charlie_priv, charlie_pub) = system.generate_key_pair().unwrap();
 
-    fn keygen(&self) -> (Vec<u8>, Vec<u8>) {
-        // Generate a key pair
-        let mut rng = rand::thread_rng();
-        let pub_key: Vec<u8> = (0..32).map(|_| rng.gen()).collect();
-        let priv_key: Vec<u8> = (0..32).map(|_| rng.gen()).collect();
-        (pub_key, priv_key)
-    }
-
-    fn encrypt(&self, pub_key: &[u8], data: &[u8]) -> Vec<u8> {
-        // Encrypt data with public key (simplified)
-        data.iter()
-            .zip(pub_key.iter().cycle())
-            .map(|(&d, &k)| d ^ k)
-            .collect()
-    }
-
-    fn decrypt(&self, priv_key: &[u8], ciphertext: &[u8]) -> Vec<u8> {
-        // Decrypt data with private key (simplified)
-        ciphertext
-            .iter()
-            .zip(priv_key.iter().cycle())
-            .map(|(&c, &k)| c ^ k)
-            .collect()
-    }
-
-    fn generate_re_encryption_key(&self, from_priv: &[u8], to_pub: &[u8]) -> Vec<u8> {
-        // Generate re-encryption key (simplified)
-        from_priv
-            .iter()
-            .zip(to_pub.iter())
-            .map(|(&f, &t)| f ^ t)
-            .collect()
-    }
-
-    fn re_encrypt(&self, re_key: &[u8], ciphertext: &[u8]) -> Vec<u8> {
-        // Re-encrypt ciphertext (simplified)
-        ciphertext
-            .iter()
-            .zip(re_key.iter().cycle())
-            .map(|(&c, &k)| c ^ k)
-            .collect()
-    }
-}
-
-pub const UP_LOW_DISTANCE: u8 = 32;
-
-struct FheAsciiString {
-    bytes: Vec<FheUint8>,
-}
-
-impl FheAsciiString {
-    fn encrypt(string: &str, client_key: &ClientKey) -> Self {
-        assert!(
-            string.chars().all(|char| char.is_ascii()),
-            "The input string must only contain ascii letters"
-        );
-
-        let fhe_bytes: Vec<FheUint8> = string
-            .bytes()
-            .map(|b| FheUint8::encrypt(b, client_key))
-            .collect();
-
-        Self { bytes: fhe_bytes }
-    }
-
-    fn decrypt(&self, client_key: &ClientKey) -> String {
-        let ascii_bytes: Vec<u8> = self
-            .bytes
-            .iter()
-            .map(|fhe_b| fhe_b.decrypt(client_key))
-            .collect();
-        String::from_utf8(ascii_bytes).unwrap()
-    }
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Generate PRE-compatible keypairs
-    let pre = PRE::setup();
-    let (alice_pub, _alice_priv) = pre.keygen();
-    let (bob_pub, bob_priv) = pre.keygen();
-    let (charlie_pub, charlie_priv) = pre.keygen();
+    let signing_keypair = system.generate_ed25519_key_pair();
 
     println!("Generated keypairs for Alice, Bob, and Charlie");
 
@@ -103,7 +32,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Alice generates TFHE-rs key to encrypt raw data
     let config = ConfigBuilder::default().build();
-
     let (client_key, server_key) = generate_keys(config);
     set_server_key(server_key);
 
@@ -112,15 +40,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Encrypted Alice's data with TFHE");
 
-    // 4. Alice encrypts TFHE-rs key with Bob's public key and hers
-    let serialized_tfhe_key = bincode::serialize(&client_key)?;
-    let encrypted_tfhe_key_for_bob = pre.encrypt(&bob_pub, &serialized_tfhe_key);
-    let _encrypted_tfhe_key_for_alice = pre.encrypt(&alice_pub, &serialized_tfhe_key);
+    // 4. Alice encrypts TFHE-rs key with Bob's public key
+    let serialized_client_key = bincode::serialize(&client_key)?;
 
-    println!("Encrypted TFHE key for Bob and Alice");
+    // Split the serialized key into chunks that fit into Plaintext
+    let chunk_size = 384; // Plaintext::ENCODED_SIZE_BYTES
+    let key_chunks: Vec<Plaintext> = serialized_client_key
+        .chunks(chunk_size)
+        .map(|chunk| {
+            let padded_chunk = pad_vec(chunk.to_vec(), chunk_size, 0);
+            Plaintext::new_from_slice(&padded_chunk).unwrap()
+        })
+        .collect();
+
+    let encrypted_chunks_for_bob: Vec<EncryptedValue> = key_chunks
+        .iter()
+        .map(|chunk| system.encrypt(chunk, &bob_pub, &signing_keypair).unwrap())
+        .collect();
+
+    let _encrypted_chunks_for_alice: Vec<EncryptedValue> = key_chunks
+        .iter()
+        .map(|chunk| system.encrypt(chunk, &alice_pub, &signing_keypair).unwrap())
+        .collect();
+
+    println!("Encrypted TFHE key for Bob");
 
     // 5. Bob decrypts data
-    let decrypted_tfhe_key = pre.decrypt(&bob_priv, &encrypted_tfhe_key_for_bob);
+    let decrypted_chunks: Vec<Plaintext> = encrypted_chunks_for_bob
+        .iter()
+        .map(|chunk| system.decrypt(chunk.clone(), &bob_priv).unwrap())
+        .collect();
+
+    let decrypted_tfhe_key: Vec<u8> = decrypted_chunks
+        .into_iter()
+        .flat_map(|chunk| chunk.bytes().to_vec())
+        .collect();
+
     let bob_tfhe_key: ClientKey = bincode::deserialize(&decrypted_tfhe_key)?;
 
     let bob_decrypted_data = encrypted_data.decrypt(&bob_tfhe_key);
@@ -128,13 +83,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Bob decrypted data: {:?}", bob_decrypted_data);
 
     // 6. Bob generates a re-encryption key for Charlie
-    let re_encryption_key = pre.generate_re_encryption_key(&bob_priv, &charlie_pub);
+    let re_encryption_key = system
+        .generate_transform_key(&bob_priv, &charlie_pub, &signing_keypair)
+        .unwrap();
+
+    println!("Bob generated re-encryption key for Charlie");
 
     // 7. TFHE-rs key gets re-encrypted
-    let re_encrypted_tfhe_key = pre.re_encrypt(&re_encryption_key, &encrypted_tfhe_key_for_bob);
+    let encrypted_chunks_for_charlie: Vec<EncryptedValue> = encrypted_chunks_for_bob
+        .iter()
+        .map(|chunk| {
+            system
+                .transform(chunk.clone(), re_encryption_key.clone(), &signing_keypair)
+                .unwrap()
+        })
+        .collect();
+
+    println!("Re-encrypted TFHE key for Charlie");
 
     // 8. Charlie decrypts data
-    let charlie_decrypted_tfhe_key = pre.decrypt(&charlie_priv, &re_encrypted_tfhe_key);
+    let charlie_decrypted_chunks: Vec<Plaintext> = encrypted_chunks_for_charlie
+        .iter()
+        .map(|chunk| system.decrypt(chunk.clone(), &charlie_priv).unwrap())
+        .collect();
+
+    let charlie_decrypted_tfhe_key: Vec<u8> = charlie_decrypted_chunks
+        .into_iter()
+        .flat_map(|chunk| chunk.bytes().to_vec())
+        .collect();
+
     let charlie_tfhe_key: ClientKey = bincode::deserialize(&charlie_decrypted_tfhe_key)?;
 
     let charlie_decrypted_data = encrypted_data.decrypt(&charlie_tfhe_key);
